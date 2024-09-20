@@ -18,7 +18,7 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
+from utils.graphics_utils import BasicPointCloud, SplatPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.sh_utils import sh_channels_4d
 
@@ -322,6 +322,42 @@ class GaussianModel:
         self._t = nn.Parameter(fused_times.requires_grad_(True))
         self._scaling_t = nn.Parameter(scales_t.requires_grad_(True))
         self._rotation_r = nn.Parameter(rots_r.requires_grad_(True))
+
+    def create_from_splat3r(self, splats, spatial_lr_scale):
+        # TODO: complete this
+        self.spatial_lr_scale = spatial_lr_scale
+        fuse_point_cloud = torch.tensor(np.asarray(splats.points)).float().cuda()
+        scaling = torch.tensor(np.asarray(splats.scaling)).float().cuda()
+        rotations = torch.tensor(np.asarray(splats.rotation)).float().cuda()
+        opacity = torch.tensor(np.asarray(splats.opacity)).float().cuda()
+        features = torch.zeros((fuse_point_cloud.shape[0], 3, self.get_max_sh_channels)).float().cuda()
+        features[:,:,0] = torch.tensor(np.asarray(splats.features_dc)).float().cuda()
+        features[:,:,1:] = 0.0
+        if self.gaussian_dim == 4:
+            # if splats.timestamp is None:
+            fuse_times = (torch.rand(fuse_point_cloud.shape[0], 1, device='cuda') * 1.2 - 0.1) * (self.time_duration[1] - self.time_duration[0]) + self.time_duration[0]
+            # else:
+            #     fuse_times = torch.tensor(np.asarray(splats['t'])).float().cuda()
+
+        if self.gaussian_dim == 4:
+            dist_t = torch.zeros_like(fuse_times, device="cuda") +(self.time_duration[1] - self.time_duration[0]) / 5.0
+            scales_t = torch.log(torch.sqrt(dist_t))
+            if self.rot_4d:
+                rots_r = torch.zeros((fuse_point_cloud.shape[0], 4), device="cuda")
+                rots_r[:, 0] = 1.0
+
+        self._xyz = nn.Parameter(fuse_point_cloud.requires_grad_(True))
+        self._scaling = nn.Parameter(scaling.requires_grad_(True))
+        self._rotation = nn.Parameter(rotations.requires_grad_(True))
+        self._opacity = nn.Parameter(opacity.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1,2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1,2).contiguous().requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if self.gaussian_dim == 4:
+            self._t = nn.Parameter(fuse_times.requires_grad_(True))
+            self._scaling_t = nn.Parameter(scales_t.requires_grad_(True))
+            if self.rot_4d:
+                self._rotation_r = nn.Parameter(rots_r.requires_grad_(True))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense

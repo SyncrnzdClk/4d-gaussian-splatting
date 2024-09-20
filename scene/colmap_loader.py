@@ -143,7 +143,7 @@ def read_points3D_binary(path_to_model_file):
 
 def read_intrinsics_text(path):
     """
-    Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_write_model.py
+    Modified to read OPENCV model data and convert to PINHOLE model.
     """
     cameras = {}
     with open(path, "r") as fid:
@@ -156,14 +156,30 @@ def read_intrinsics_text(path):
                 elems = line.split()
                 camera_id = int(elems[0])
                 model = elems[1]
-                assert model == "PINHOLE", "While the loader support other types, the rest of the code assumes PINHOLE"
                 width = int(elems[2])
                 height = int(elems[3])
-                params = np.array(tuple(map(float, elems[4:])))
+                if model == "OPENCV":
+                    # Extract OPENCV parameters
+                    fx = float(elems[4])
+                    fy = float(elems[5])
+                    cx = float(elems[6])
+                    cy = float(elems[7])
+                    # Create PINHOLE model parameters
+                    params = np.array([fx, fy, cx, cy])
+                    # Update model to PINHOLE
+                    model = "PINHOLE"
+                elif model == "PINHOLE":
+                    # If already PINHOLE, extract params directly
+                    params = np.array(tuple(map(float, elems[4:])))
+                else:
+                    # Skip other models
+                    assert False, "cannot process this kind of model"
+
                 cameras[camera_id] = Camera(id=camera_id, model=model,
                                             width=width, height=height,
                                             params=params)
     return cameras
+
 
 def read_extrinsics_binary(path_to_model_file):
     """

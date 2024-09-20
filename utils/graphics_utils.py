@@ -20,6 +20,15 @@ class BasicPointCloud(NamedTuple):
     normals : np.array
     time : np.array = None
 
+class SplatPointCloud(NamedTuple):
+    points : np.array
+    features_dc : np.array
+    opacity : np.array
+    scaling : np.array
+    rotation : np.array
+    # normals : np.array
+    time : np.array = None
+
 def geom_transform_points(points, transf_matrix):
     P, _ = points.shape
     ones = torch.ones(P, 1, dtype=points.dtype, device=points.device)

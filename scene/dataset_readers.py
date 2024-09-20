@@ -21,13 +21,13 @@ import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
-from scene.gaussian_model import BasicPointCloud
+from scene.gaussian_model import BasicPointCloud, SplatPointCloud
 from tqdm import tqdm
 import torch
 from utils.general_utils import fps
 from multiprocessing.pool import ThreadPool
 import imagesize
-
+from scipy.spatial.transform import Rotation
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -47,11 +47,12 @@ class CameraInfo(NamedTuple):
     cy: float = -1.0
 
 class SceneInfo(NamedTuple):
-    point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    point_cloud: BasicPointCloud = None
+    splat_point_cloud: SplatPointCloud = None
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -110,10 +111,22 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, depth=None)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
+
+def fetchPly_splats(path):
+    plydata = PlyData.read(path)
+    vertices = plydata['vertex']
+    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    features_dc = np.vstack([vertices['f_dc_0'], vertices['f_dc_1'], vertices['f_dc_2']]).T
+    opacity = vertices['opacity'].reshape(-1,1)
+    scaling = np.vstack([vertices['scale_0'], vertices['scale_1'], vertices['scale_2']]).T
+    rotation = np.vstack([vertices['rot_0'], vertices['rot_1'], vertices['rot_2'], vertices['rot_3']]).T
+    # normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    return SplatPointCloud(points=positions, features_dc=features_dc, opacity=opacity, scaling=scaling, rotation=rotation)
+
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -209,7 +222,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, num_pts_ratio=1.0):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", time_duration=None, frame_ratio=1, dataloader=False):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", time_duration=None, frame_ratio=1, dataloader=False):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -223,11 +236,14 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         idx = idx_frame[0]
         frame = idx_frame[1]
         timestamp = frame.get('time', 0.0)
+        camera_name = frame.get('file_path').split("/")[1]
         if frame_ratio > 1:
             timestamp /= frame_ratio
         if time_duration is not None and 'time' in frame:
             if timestamp < time_duration[0] or timestamp > time_duration[1]:
                 return
+        if camera_name != "01" and camera_name != "20" and camera_name != "00":
+            return
 
         cam_name = os.path.join(path, frame["file_path"] + extension)
 
@@ -262,7 +278,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         else:
             image = np.empty(0)
             width, height = imagesize.get(image_path)
-        
+
         if 'depth_path' in frame:
             depth_name = frame["depth_path"]
             if not extension in frame["depth_path"]:
@@ -307,7 +323,67 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
     
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png", num_pts=100_000, time_duration=None, num_extra_pts=0, frame_ratio=1, dataloader=False):
+def readNerfSyntheticFromSplat(path, white_background, eval, extension=".jpg", num_pts=100_000, time_duration=None, num_extra_pts=0, frame_ratio=1, dataloader=False):
+    print("Reading Training Transforms")
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, time_duration=time_duration, frame_ratio=frame_ratio, dataloader=dataloader)
+    print("Reading Test Transforms")
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json" if not path.endswith('lego') else "transforms_val.json", white_background, extension, time_duration=time_duration, frame_ratio=frame_ratio, dataloader=dataloader)
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "gaussians.ply")
+    assert os.path.exists(ply_path), "No splat file found"
+    try:
+        splats = fetchPly_splats(ply_path)
+        R_c2w = train_cam_infos[0].R
+        # R_c2w[:, 1:3] *= -1
+        T_w2c = train_cam_infos[0].T
+        # R_c2w = np.linalg.inv(R_w2c)
+        T_c2w = -T_w2c
+
+        # transform the points from camera to world
+        xyz = splats.points @ R_c2w.T + T_c2w
+
+        # transform the quat from camera to world
+        quat = splats.rotation
+        rot_q = Rotation.from_quat(quat)
+        rot_matrix = rot_q.as_matrix()
+        new_rot_matrix = R_c2w @ rot_matrix @ R_c2w.T
+        new_rot = Rotation.from_matrix(new_rot_matrix)
+        new_quat = new_rot.as_quat()
+        # rotation = splats.rotation @ R_c2w.T
+        features_dc = splats.features_dc
+        scaling = splats.scaling
+        opacity = splats.opacity
+        splats = SplatPointCloud(points=xyz, features_dc=features_dc, scaling=scaling, rotation=new_quat, opacity=opacity)
+        # splats.points = xyz
+        # splats.rotation = rotation
+    except:
+        assert False, "reading splats failed"
+
+    if splats.points.shape[0] > num_pts:
+        # mask = np.random.randint(0, splats.points.shape[0], num_pts)
+        mask = np.random.choice(splats.points.shape[0], num_pts, replace=False)
+        xyz = splats.points[mask]
+        features_dc = splats.features_dc[mask]
+        scaling = splats.scaling[mask]
+        rotation = splats.rotation[mask]
+        opacity = splats.opacity[mask]
+        # normals = splats.normals[mask]
+        splats = SplatPointCloud(points=xyz, features_dc=features_dc, scaling=scaling, rotation=rotation, opacity=opacity)
+
+    scene_info = SceneInfo(splat_point_cloud=splats,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", num_pts=100_000, time_duration=None, num_extra_pts=0, frame_ratio=1, dataloader=False):
     
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, time_duration=time_duration, frame_ratio=frame_ratio, dataloader=dataloader)
@@ -353,7 +429,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", num_pt
             normals = normals[time_mask]
             times = times[time_mask]
         pcd = BasicPointCloud(points=xyz, colors=rgb, normals=normals, time=times)
-        
+
     if num_extra_pts > 0:
         times = pcd.time
         xyz = pcd.points
@@ -369,20 +445,20 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", num_pt
         xyz_extra = np.stack([x, y, z], axis=1)
         normals_extra = np.zeros_like(xyz_extra)
         rgb_extra = np.ones((num_extra_pts, 3)) / 2
-        
+
         xyz = np.concatenate([xyz, xyz_extra], axis=0)
         rgb = np.concatenate([rgb, rgb_extra], axis=0)
         normals = np.concatenate([normals, normals_extra], axis=0)
-        
+
         if times is not None:
             times_extra = torch.zeros(((num_extra_pts, 3))) + (time_duration[0] + time_duration[1]) / 2
             times = np.concatenate([times, times_extra], axis=0)
-            
-        pcd = BasicPointCloud(points=xyz, 
+
+        pcd = BasicPointCloud(points=xyz,
                               colors=rgb,
                               normals=normals,
                               time=times)
-        
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
@@ -392,5 +468,6 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", num_pt
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Blender_Splat" : readNerfSyntheticFromSplat
 }

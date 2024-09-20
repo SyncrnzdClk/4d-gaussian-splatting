@@ -1,6 +1,6 @@
 gaussian_dim: 4
-time_duration: [0.0, 10.0]
-num_pts: 300_000
+time_duration: [0.0, 2.0]
+num_pts: 600_000
 num_pts_ratio: 1.0
 rot_4d: True
 force_sh_3d: False
@@ -10,13 +10,13 @@ exhaust_test: True
 ModelParams:
   sh_degree: 3
   source_path: "data/N3V/flame_salmon"
-  model_path: "output/N3V/flame_salmon"
+  model_path: "output2/N3V/flame_salmon"
   images: "images"
   resolution: 2
   white_background: False
   data_device: "cuda"
   eval: True
-  extension: ".png"
+  extension: ".jpg"
   num_extra_pts: 0
   loaded_pth: ""
   frame_ratio: 1
